@@ -1,12 +1,194 @@
+import { WorkflowEntrypoint } from 'cloudflare:workers';
 import { InteractionType, InteractionResponseType, verifyKey } from 'discord-interactions';
 
+// 1. バックグラウンドで実行される非同期ワークフロー
+export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
+  async run(event, step) {
+    const { imageUrl, appId, token } = event.payload;
+    const env = this.env;
+    const followupUrl = `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`;
+
+    await step.do('analyze-deck-and-reply', async () => {
+      try {
+        console.log('--- ワークフロー処理開始 ---');
+
+        // 画像取得 & マスターデータ取得
+        const imagePromise = (async () => {
+          const res = await fetch(imageUrl);
+          const buffer = await res.arrayBuffer();
+          return {
+            base64: arrayBufferToBase64(buffer),
+            mimeType: res.headers.get('content-type') || 'image/jpeg',
+          };
+        })();
+
+        const sheetPromise = (async () => {
+          const res = await fetch(env.MASTER_SHEET_CSV_URL);
+          const text = await res.text();
+          return parseCSV(text);
+        })();
+
+        // APIキー抽出
+        const apiKeys = [];
+        if (env.GEMINI_API_KEY) {
+          env.GEMINI_API_KEY.split(',').forEach((k) => {
+            const trimmed = k.trim();
+            if (trimmed) apiKeys.push(trimmed);
+          });
+        }
+        for (let i = 2; i <= 10; i++) {
+          const keyName = `GEMINI_API_KEY_${i}`;
+          if (env[keyName]) {
+            const trimmed = env[keyName].trim();
+            if (trimmed && !apiKeys.includes(trimmed)) apiKeys.push(trimmed);
+          }
+        }
+
+        if (apiKeys.length === 0) {
+          throw new Error('GEMINI_API_KEY が設定されていません。');
+        }
+
+        const [{ base64: base64Image, mimeType }, masterRows] = await Promise.all([
+          imagePromise,
+          sheetPromise,
+        ]);
+
+        const prompt = `
+        添付されたトレーディングカードゲーム「蟲神器」のデッキリスト画像を非常に精密に解析してください。
+        画像に含まれるすべてのカードについて、以下の情報を正確に読み取ってください。
+
+        - card_name: カード名（漢字・ひらがな・カタカナを正確に読み取ってください）
+        - color: カードの色（"赤", "青", "緑", "無色", "術・強化"）
+        - cost: カード左上のコスト数値（0〜10の整数）
+        - count: 画像内の同名カードの枚数（1または2）
+
+        出力は以下のプロパティを持つJSONオブジェクトの配列として出力してください:
+        [{"card_name": "オオアカエダカマキリ", "color": "赤", "cost": 6, "count": 1}]
+        `;
+
+        const geminiPayload = {
+          contents: [
+            {
+              parts: [
+                { inlineData: { mimeType: mimeType, data: base64Image } },
+                { text: prompt },
+              ],
+            },
+          ],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            temperature: 0.0,
+          },
+        };
+
+        // 複数キーでのGemini呼び出し（順次フォールバック）
+        const geminiData = await fetchGeminiSequential(apiKeys, geminiPayload);
+        const textResult = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+        const cardsDetected = JSON.parse(textResult);
+
+        // カード照合処理
+        let totalMatched = 0;
+        const summaryLines = [];
+        const outputCounts = new Array(masterRows.length).fill(0);
+
+        for (const card of cardsDetected) {
+          const name = String(card.card_name || '').trim();
+          const color = String(card.color || '').trim();
+          const cost = String(card.cost ?? '').trim();
+          const count = Number(card.count || 1);
+
+          let matchedIndex = masterRows.findIndex(
+            (r) =>
+              r.card_name === name &&
+              r.color_name === color &&
+              String(r.cost) === cost
+          );
+
+          if (matchedIndex === -1) {
+            const sameColorCostCandidates = masterRows
+              .map((r, idx) => ({ row: r, index: idx }))
+              .filter(
+                ({ row }) =>
+                  row.color_name === color && String(row.cost) === cost
+              );
+
+            if (sameColorCostCandidates.length > 0) {
+              let minDistance = Infinity;
+              let bestCandidateIndex = -1;
+
+              for (const candidate of sameColorCostCandidates) {
+                const dist = getLevenshteinDistance(name, candidate.row.card_name);
+                if (dist < minDistance) {
+                  minDistance = dist;
+                  bestCandidateIndex = candidate.index;
+                }
+              }
+              matchedIndex = bestCandidateIndex;
+            }
+          }
+
+          if (matchedIndex === -1) {
+            matchedIndex = masterRows.findIndex((r) => r.card_name === name);
+          }
+
+          if (matchedIndex !== -1) {
+            const matchedCard = masterRows[matchedIndex];
+            outputCounts[matchedIndex] += count;
+            totalMatched += count;
+            summaryLines.push(
+              `・${matchedCard.card_name} (${color}/コスト${cost}): ${count}枚`
+            );
+          } else {
+            summaryLines.push(`⚠️ 照合失敗: ${name} (${color}/コスト${cost})`);
+          }
+        }
+
+        // CSV生成
+        let csvContent = 'image,label,item-count,item-key\n';
+        for (let i = 0; i < masterRows.length; i++) {
+          const r = masterRows[i];
+          csvContent += `"${r.image_url}","${r.original_label}",${outputCounts[i]},"${r['item-key']}"\n`;
+        }
+
+        const summaryText =
+          `【解析完了】計 ${totalMatched} 枚を照合しました。\n` +
+          summaryLines.join('\n');
+
+        // Discordへ結果送信
+        const formData = new FormData();
+        formData.append('payload_json', JSON.stringify({ content: summaryText }));
+        formData.append(
+          'files[0]',
+          new Blob([csvContent], { type: 'text/csv' }),
+          'playingcards_deck_import.csv'
+        );
+
+        await fetch(followupUrl, {
+          method: 'PATCH',
+          body: formData,
+        });
+        console.log('--- ワークフロー処理完了 ---');
+      } catch (err) {
+        console.error('ワークフロー処理失敗:', err.message);
+        await fetch(followupUrl, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: `❌ エラーが発生しました:\n> ${err.message}`,
+          }),
+        });
+      }
+    });
+  }
+}
+
+// 2. メイン Worker（Discordインタラクション受信）
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== 'POST') {
       return new Response('Method Not Allowed', { status: 405 });
     }
 
-    // 1. Discord 署名検証
     const signature = request.headers.get('x-signature-ed25519');
     const timestamp = request.headers.get('x-signature-timestamp');
     const bodyText = await request.text();
@@ -24,14 +206,12 @@ export default {
 
     const interaction = JSON.parse(bodyText);
 
-    // 2. PING (Discord 接続確認)
     if (interaction.type === InteractionType.PING) {
       return new Response(JSON.stringify({ type: InteractionResponseType.PONG }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
 
-    // 3. /deck コマンド処理
     if (
       interaction.type === InteractionType.APPLICATION_COMMAND &&
       interaction.data.name === 'deck'
@@ -53,10 +233,16 @@ export default {
         );
       }
 
-      ctx.waitUntil(
-        processDeckAndFollowup(attachment.url, appId, interactionToken, env)
-      );
+      // Workflows を起動してバックグラウンド処理に移譲
+      await env.DECK_WORKFLOW.create({
+        params: {
+          imageUrl: attachment.url,
+          appId: appId,
+          token: interactionToken,
+        },
+      });
 
+      // Discord には即座に「考え中...」のレスポンスを返す
       return new Response(
         JSON.stringify({
           type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
@@ -69,218 +255,7 @@ export default {
   },
 };
 
-async function processDeckAndFollowup(imageUrl, appId, token, env) {
-  const followupUrl = `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`;
-
-  // Cloudflareの30秒強制終了を防ぐため、28秒で安全に自前タイムアウトを発生させる
-  const OVERALL_TIMEOUT_MS = 28000;
-  let timeoutId = null;
-
-  const timeoutPromise = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(
-        new Error(
-          'Cloudflareの制限時間を回避するため28秒で打ち切りました。Gemini APIの応答遅延または画像処理に時間がかかりすぎています。'
-        )
-      );
-    }, OVERALL_TIMEOUT_MS);
-  });
-
-  try {
-    // 実際の処理と28秒タイマーを競わせる
-    await Promise.race([
-      executeDeckTask(imageUrl, followupUrl, env),
-      timeoutPromise,
-    ]);
-  } catch (err) {
-    console.error('処理エラー:', err.message);
-    try {
-      // タイムアウトやエラーが発生した場合は、原因をDiscordに確実に通知する
-      await fetch(followupUrl, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          content: `❌ エラーが発生しました:\n> ${err.message}`,
-        }),
-      });
-    } catch (patchErr) {
-      console.error('Discordへのエラー返信失敗:', patchErr.message);
-    }
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
-  }
-}
-
-async function executeDeckTask(imageUrl, followupUrl, env) {
-  console.log('--- 処理開始 ---');
-
-  // 1. 画像ダウンロード & マスターデータ取得
-  const imagePromise = (async () => {
-    const res = await fetch(imageUrl);
-    const buffer = await res.arrayBuffer();
-    return {
-      base64: arrayBufferToBase64(buffer),
-      mimeType: res.headers.get('content-type') || 'image/jpeg',
-    };
-  })();
-
-  const sheetPromise = (async () => {
-    const res = await fetch(env.MASTER_SHEET_CSV_URL);
-    const text = await res.text();
-    return parseCSV(text);
-  })();
-
-  // APIキーの抽出
-  const apiKeys = [];
-  if (env.GEMINI_API_KEY) {
-    env.GEMINI_API_KEY.split(',').forEach((k) => {
-      const trimmed = k.trim();
-      if (trimmed) apiKeys.push(trimmed);
-    });
-  }
-  for (let i = 2; i <= 10; i++) {
-    const keyName = `GEMINI_API_KEY_${i}`;
-    if (env[keyName]) {
-      const trimmed = env[keyName].trim();
-      if (trimmed && !apiKeys.includes(trimmed)) apiKeys.push(trimmed);
-    }
-  }
-
-  if (apiKeys.length === 0) {
-    throw new Error('GEMINI_API_KEY が設定されていません。');
-  }
-
-  const [{ base64: base64Image, mimeType }, masterRows] = await Promise.all([
-    imagePromise,
-    sheetPromise,
-  ]);
-
-  // 2. Gemini APIプロンプト設定
-  const prompt = `
-  添付されたトレーディングカードゲーム「蟲神器」のデッキリスト画像を非常に精密に解析してください。
-  画像に含まれるすべてのカードについて、以下の情報を正確に読み取ってください。
-
-  - card_name: カード名（漢字・ひらがな・カタカナを正確に読み取ってください）
-  - color: カードの色（"赤", "青", "緑", "無色", "術・強化"）
-  - cost: カード左上のコスト数値（0〜10の整数）
-  - count: 画像内の同名カードの枚数（1または2）
-
-  出力は以下のプロパティを持つJSONオブジェクトの配列として出力してください:
-  [{"card_name": "オオアカエダカマキリ", "color": "赤", "cost": 6, "count": 1}]
-  `;
-
-  const geminiPayload = {
-    contents: [
-      {
-        parts: [
-          { inlineData: { mimeType: mimeType, data: base64Image } },
-          { text: prompt },
-        ],
-      },
-    ],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      temperature: 0.0,
-    },
-  };
-
-  // 3. 高速順次フォールバック（エラー即時検知）
-  const geminiData = await fetchGeminiSequential(apiKeys, geminiPayload);
-
-  const textResult = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-  const cardsDetected = JSON.parse(textResult);
-
-  // 4. カード照合
-  let totalMatched = 0;
-  const summaryLines = [];
-  const outputCounts = new Array(masterRows.length).fill(0);
-
-  for (const card of cardsDetected) {
-    const name = String(card.card_name || '').trim();
-    const color = String(card.color || '').trim();
-    const cost = String(card.cost ?? '').trim();
-    const count = Number(card.count || 1);
-
-    // 優先度1: 完全一致
-    let matchedIndex = masterRows.findIndex(
-      (r) =>
-        r.card_name === name &&
-        r.color_name === color &&
-        String(r.cost) === cost
-    );
-
-    // 優先度2: 色・コスト一致の中で類似度判定
-    if (matchedIndex === -1) {
-      const sameColorCostCandidates = masterRows
-        .map((r, idx) => ({ row: r, index: idx }))
-        .filter(
-          ({ row }) =>
-            row.color_name === color && String(row.cost) === cost
-        );
-
-      if (sameColorCostCandidates.length > 0) {
-        let minDistance = Infinity;
-        let bestCandidateIndex = -1;
-
-        for (const candidate of sameColorCostCandidates) {
-          const dist = getLevenshteinDistance(name, candidate.row.card_name);
-          if (dist < minDistance) {
-            minDistance = dist;
-            bestCandidateIndex = candidate.index;
-          }
-        }
-        matchedIndex = bestCandidateIndex;
-      }
-    }
-
-    // 優先度3: 名前の一致判定
-    if (matchedIndex === -1) {
-      matchedIndex = masterRows.findIndex((r) => r.card_name === name);
-    }
-
-    if (matchedIndex !== -1) {
-      const matchedCard = masterRows[matchedIndex];
-      outputCounts[matchedIndex] += count;
-      totalMatched += count;
-      summaryLines.push(
-        `・${matchedCard.card_name} (${color}/コスト${cost}): ${count}枚`
-      );
-    } else {
-      summaryLines.push(`⚠️ 照合失敗: ${name} (${color}/コスト${cost})`);
-    }
-  }
-
-  // CSV生成
-  let csvContent = 'image,label,item-count,item-key\n';
-  for (let i = 0; i < masterRows.length; i++) {
-    const r = masterRows[i];
-    csvContent += `"${r.image_url}","${r.original_label}",${outputCounts[i]},"${r['item-key']}"\n`;
-  }
-
-  const summaryText =
-    `【解析完了】計 ${totalMatched} 枚を照合しました。\n` +
-    summaryLines.join('\n');
-
-  // 5. Discordへ結果返信
-  const formData = new FormData();
-  formData.append(
-    'payload_json',
-    JSON.stringify({ content: summaryText })
-  );
-  formData.append(
-    'files[0]',
-    new Blob([csvContent], { type: 'text/csv' }),
-    'playingcards_deck_import.csv'
-  );
-
-  await fetch(followupUrl, {
-    method: 'PATCH',
-    body: formData,
-  });
-  console.log('--- 処理完了 ---');
-}
-
-// 順次フォールバック関数（エラー即時検知）
+// ユーティリティ関数群
 async function fetchGeminiSequential(apiKeys, payload) {
   let lastError = '';
 
@@ -289,18 +264,12 @@ async function fetchGeminiSequential(apiKeys, payload) {
     console.log(`APIキー #${i + 1} を試行中...`);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
-    // 個別キーごとの応答待ち上限（12秒）
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 12000);
-
     try {
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-        signal: controller.signal,
       });
-      clearTimeout(timeoutId);
 
       if (res.ok) {
         console.log(`APIキー #${i + 1} で成功しました。`);
@@ -311,8 +280,7 @@ async function fetchGeminiSequential(apiKeys, payload) {
       lastError = `Key #${i + 1} (HTTP ${res.status}): ${errText}`;
       console.warn(`APIキー #${i + 1} 失敗 -> 次のキーへ。理由: HTTP ${res.status}`);
     } catch (err) {
-      clearTimeout(timeoutId);
-      lastError = `Key #${i + 1} エラー: ${err.name === 'AbortError' ? '12秒タイムアウト' : err.message}`;
+      lastError = `Key #${i + 1} エラー: ${err.message}`;
       console.warn(`APIキー #${i + 1} 例外発生 -> 次のキーへ。`);
     }
   }
