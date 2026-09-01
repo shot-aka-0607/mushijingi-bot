@@ -109,8 +109,8 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
           throw new Error(`Geminiの応答をJSONとしてパースできませんでした。生出力: ${rawText}`);
         }
 
-        // 4. カード照合処理
-        console.log('🔍 [MATCHING] マスターシートとの照合を開始します...');
+        // 4. カード照合処理（3要素総合スコアリング方式）
+        console.log('🔍 [MATCHING] マスターシートとの照合（重み付け判定）を開始します...');
         let totalMatched = 0;
         const summaryLines = [];
         const outputCounts = new Array(masterRows.length).fill(0);
@@ -122,57 +122,48 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
           const cost = String(card.cost ?? '').trim();
           const count = Number(card.count || 1);
 
-          // 完全一致
-          let matchedIndex = masterRows.findIndex(
-            (r) =>
-              r.card_name === name &&
-              r.color_name === color &&
-              String(r.cost) === cost
-          );
-          let matchType = '完全一致';
+          let bestIndex = -1;
+          let maxScore = -1;
 
-          // 色・コスト一致 ＋ 類似度判定
-          if (matchedIndex === -1) {
-            const sameColorCostCandidates = masterRows
-              .map((r, idx) => ({ row: r, index: idx }))
-              .filter(
-                ({ row }) =>
-                  row.color_name === color && String(row.cost) === cost
-              );
+          for (let i = 0; i < masterRows.length; i++) {
+            const row = masterRows[i];
 
-            if (sameColorCostCandidates.length > 0) {
-              let minDistance = Infinity;
-              let bestCandidateIndex = -1;
+            // A. カード名の類似度算出 (0.0 〜 1.0)
+            const dist = getLevenshteinDistance(name, row.card_name);
+            const maxLength = Math.max(name.length, row.card_name.length);
+            const nameSimilarity = maxLength === 0 ? 1 : 1 - dist / maxLength;
 
-              for (const candidate of sameColorCostCandidates) {
-                const dist = getLevenshteinDistance(name, candidate.row.card_name);
-                if (dist < minDistance) {
-                  minDistance = dist;
-                  bestCandidateIndex = candidate.index;
-                }
-              }
-              matchedIndex = bestCandidateIndex;
-              matchType = '類似度補正';
+            // B. 色・コストの一致判定 (0 または 1)
+            const colorMatched = row.color_name === color ? 1 : 0;
+            const costMatched = String(row.cost) === cost ? 1 : 0;
+
+            // C. 総合スコア計算（重み付け: 名前70% / 色15% / コスト15%）
+            const totalScore =
+              nameSimilarity * 0.70 + colorMatched * 0.15 + costMatched * 0.15;
+
+            if (totalScore > maxScore) {
+              maxScore = totalScore;
+              bestIndex = i;
             }
           }
 
-          // 名前のみ一致
-          if (matchedIndex === -1) {
-            matchedIndex = masterRows.findIndex((r) => r.card_name === name);
-            if (matchedIndex !== -1) matchType = '名前のみ一致';
-          }
-
-          if (matchedIndex !== -1) {
-            const matchedCard = masterRows[matchedIndex];
-            outputCounts[matchedIndex] += count;
+          // 最低スコア閾値（0.40未満は無関係なカードとして弾く）
+          if (bestIndex !== -1 && maxScore >= 0.40) {
+            const matchedCard = masterRows[bestIndex];
+            outputCounts[bestIndex] += count;
             totalMatched += count;
+
             summaryLines.push(
-              `・${matchedCard.card_name} (${color}/コスト${cost}): ${count}枚`
+              `・${matchedCard.card_name} (${matchedCard.color_name}/コスト${matchedCard.cost}): ${count}枚`
             );
-            matchLogs.push(`  [SUCCESS] 認識: "${name}" ➔ 一致: "${matchedCard.card_name}" (${matchType}, ${count}枚)`);
+            matchLogs.push(
+              `  [SUCCESS] 認識: "${name}"(${color}/コスト${cost}) ➔ 一致: "${matchedCard.card_name}" (Score: ${maxScore.toFixed(2)}, ${count}枚)`
+            );
           } else {
             summaryLines.push(`⚠️ 照合失敗: ${name} (${color}/コスト${cost})`);
-            matchLogs.push(`  [FAILED] 認識: "${name}" (${color}/コスト${cost}) ➔ マッチするカードなし`);
+            matchLogs.push(
+              `  [FAILED] 認識: "${name}"(${color}/コスト${cost}) ➔ 適合カードなし (最高Score: ${maxScore.toFixed(2)})`
+            );
           }
         }
 
