@@ -1,31 +1,40 @@
 import { WorkflowEntrypoint } from 'cloudflare:workers';
 import { InteractionType, InteractionResponseType, verifyKey } from 'discord-interactions';
 
-// 1. バックグラウンドで実行される非同期ワークフロー
 export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
     const { imageUrl, appId, token } = event.payload;
     const env = this.env;
     const followupUrl = `https://discord.com/api/v10/webhooks/${appId}/${token}/messages/@original`;
 
-    await step.do('analyze-deck-and-reply', async () => {
-      try {
-        console.log('--- ワークフロー処理開始 ---');
+    await step.do('process-deck-analysis', async () => {
+      console.log('🚀 [START] ワークフロー開始');
+      console.log(`📌 [PARAM] Image URL: ${imageUrl}`);
+      console.log(`📌 [PARAM] App ID: ${appId}`);
 
-        // 画像取得 & マスターデータ取得
+      try {
+        // 1. 画像 & マスターデータ取得
+        console.log('📥 [FETCH] 画像およびマスターシートの取得を開始します...');
+        
         const imagePromise = (async () => {
           const res = await fetch(imageUrl);
+          if (!res.ok) throw new Error(`画像ダウンロード失敗: HTTP ${res.status}`);
           const buffer = await res.arrayBuffer();
+          const mimeType = res.headers.get('content-type') || 'image/jpeg';
+          console.log(`✅ [FETCH] 画像取得成功 (MIME: ${mimeType}, Size: ${buffer.byteLength} bytes)`);
           return {
             base64: arrayBufferToBase64(buffer),
-            mimeType: res.headers.get('content-type') || 'image/jpeg',
+            mimeType: mimeType,
           };
         })();
 
         const sheetPromise = (async () => {
           const res = await fetch(env.MASTER_SHEET_CSV_URL);
+          if (!res.ok) throw new Error(`マスターシート取得失敗: HTTP ${res.status}`);
           const text = await res.text();
-          return parseCSV(text);
+          const rows = parseCSV(text);
+          console.log(`✅ [FETCH] マスターシート取得成功 (全 ${rows.length} 行)`);
+          return rows;
         })();
 
         // APIキー抽出
@@ -44,8 +53,9 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
           }
         }
 
+        console.log(`🔑 [CONFIG] 利用可能なGemini APIキー数: ${apiKeys.length}個`);
         if (apiKeys.length === 0) {
-          throw new Error('GEMINI_API_KEY が設定されていません。');
+          throw new Error('GEMINI_API_KEY が1つも設定されていません。');
         }
 
         const [{ base64: base64Image, mimeType }, masterRows] = await Promise.all([
@@ -53,6 +63,7 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
           sheetPromise,
         ]);
 
+        // 2. Gemini APIプロンプト作成
         const prompt = `
         添付されたトレーディングカードゲーム「蟲神器」のデッキリスト画像を非常に精密に解析してください。
         画像に含まれるすべてのカードについて、以下の情報を正確に読み取ってください。
@@ -81,15 +92,29 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
           },
         };
 
-        // 複数キーでのGemini呼び出し（順次フォールバック）
+        // 3. Gemini API呼び出し
+        console.log('🤖 [GEMINI] Gemini APIへ解析リクエストを送信します...');
         const geminiData = await fetchGeminiSequential(apiKeys, geminiPayload);
-        const textResult = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-        const cardsDetected = JSON.parse(textResult);
+        
+        const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+        console.log(`📄 [GEMINI] 応答テキスト受信 (文字数: ${rawText.length}文字)`);
+        console.log(`🔍 [GEMINI_RAW_OUTPUT]\n${rawText}`);
 
-        // カード照合処理
+        let cardsDetected = [];
+        try {
+          cardsDetected = JSON.parse(rawText);
+          console.log(`✅ [GEMINI] 認識されたカード種類数: ${cardsDetected.length}種類`);
+        } catch (jsonErr) {
+          console.error('❌ [GEMINI] JSONパース失敗:', jsonErr.message);
+          throw new Error(`Geminiの応答をJSONとしてパースできませんでした。生出力: ${rawText}`);
+        }
+
+        // 4. カード照合処理
+        console.log('🔍 [MATCHING] マスターシートとの照合を開始します...');
         let totalMatched = 0;
         const summaryLines = [];
         const outputCounts = new Array(masterRows.length).fill(0);
+        const matchLogs = [];
 
         for (const card of cardsDetected) {
           const name = String(card.card_name || '').trim();
@@ -97,13 +122,16 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
           const cost = String(card.cost ?? '').trim();
           const count = Number(card.count || 1);
 
+          // 完全一致
           let matchedIndex = masterRows.findIndex(
             (r) =>
               r.card_name === name &&
               r.color_name === color &&
               String(r.cost) === cost
           );
+          let matchType = '完全一致';
 
+          // 色・コスト一致 ＋ 類似度判定
           if (matchedIndex === -1) {
             const sameColorCostCandidates = masterRows
               .map((r, idx) => ({ row: r, index: idx }))
@@ -124,11 +152,14 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
                 }
               }
               matchedIndex = bestCandidateIndex;
+              matchType = '類似度補正';
             }
           }
 
+          // 名前のみ一致
           if (matchedIndex === -1) {
             matchedIndex = masterRows.findIndex((r) => r.card_name === name);
+            if (matchedIndex !== -1) matchType = '名前のみ一致';
           }
 
           if (matchedIndex !== -1) {
@@ -138,10 +169,15 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
             summaryLines.push(
               `・${matchedCard.card_name} (${color}/コスト${cost}): ${count}枚`
             );
+            matchLogs.push(`  [SUCCESS] 認識: "${name}" ➔ 一致: "${matchedCard.card_name}" (${matchType}, ${count}枚)`);
           } else {
             summaryLines.push(`⚠️ 照合失敗: ${name} (${color}/コスト${cost})`);
+            matchLogs.push(`  [FAILED] 認識: "${name}" (${color}/コスト${cost}) ➔ マッチするカードなし`);
           }
         }
+
+        console.log(`📊 [MATCHING_LOGS]\n${matchLogs.join('\n')}`);
+        console.log(`✅ [MATCHING] 照合完了: 合計 ${totalMatched} 枚ヒット`);
 
         // CSV生成
         let csvContent = 'image,label,item-count,item-key\n';
@@ -154,7 +190,8 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
           `【解析完了】計 ${totalMatched} 枚を照合しました。\n` +
           summaryLines.join('\n');
 
-        // Discordへ結果送信
+        // 5. Discordへ結果送信
+        console.log('📤 [DISCORD] 結果をDiscordへPATCH送信します...');
         const formData = new FormData();
         formData.append('payload_json', JSON.stringify({ content: summaryText }));
         formData.append(
@@ -163,26 +200,42 @@ export class DeckAnalysisWorkflow extends WorkflowEntrypoint {
           'playingcards_deck_import.csv'
         );
 
-        await fetch(followupUrl, {
+        const discordRes = await fetch(followupUrl, {
           method: 'PATCH',
           body: formData,
         });
-        console.log('--- ワークフロー処理完了 ---');
+
+        if (!discordRes.ok) {
+          const discordErrText = await discordRes.text();
+          throw new Error(`Discordへの返信送信失敗 (HTTP ${discordRes.status}): ${discordErrText}`);
+        }
+
+        console.log('🎉 [FINISHED] 全処理が正常に完了しました！');
       } catch (err) {
-        console.error('ワークフロー処理失敗:', err.message);
-        await fetch(followupUrl, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            content: `❌ エラーが発生しました:\n> ${err.message}`,
-          }),
-        });
+        console.error('💥 [ERROR] ワークフロー内でエラーが発生しました:', err.stack || err.message);
+        
+        // Discordへエラー内容を通知
+        try {
+          await fetch(followupUrl, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              content: `❌ エラーが発生しました:\n> ${err.message}`,
+            }),
+          });
+          console.log('📤 [DISCORD] Discordへエラーメッセージを通知しました。');
+        } catch (patchErr) {
+          console.error('💥 [ERROR] Discordへのエラー通知に失敗しました:', patchErr.message);
+        }
+
+        // ワークフローを失敗ステータスとして記録するために例外を再スロー
+        throw err;
       }
     });
   }
 }
 
-// 2. メイン Worker（Discordインタラクション受信）
+// メイン Worker
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== 'POST') {
@@ -201,6 +254,7 @@ export default {
     );
 
     if (!isValidRequest) {
+      console.warn('⚠️ [SECURITY] 不正な署名のリクエストを拒否しました。');
       return new Response('Bad request signature', { status: 401 });
     }
 
@@ -216,6 +270,7 @@ export default {
       interaction.type === InteractionType.APPLICATION_COMMAND &&
       interaction.data.name === 'deck'
     ) {
+      console.log('📩 [INTERACTION] /deck コマンドを受信しました。');
       const interactionToken = interaction.token;
       const appId = env.DISCORD_APPLICATION_ID;
 
@@ -224,6 +279,7 @@ export default {
       const attachment = resolvedAttachments?.[optionImageId];
 
       if (!attachment || !attachment.url) {
+        console.warn('⚠️ [INTERACTION] 画像添付が見つかりませんでした。');
         return new Response(
           JSON.stringify({
             type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
@@ -233,8 +289,8 @@ export default {
         );
       }
 
-      // Workflows を起動してバックグラウンド処理に移譲
-      await env.DECK_WORKFLOW.create({
+      // Workflows を起動
+      const instance = await env.DECK_WORKFLOW.create({
         params: {
           imageUrl: attachment.url,
           appId: appId,
@@ -242,7 +298,8 @@ export default {
         },
       });
 
-      // Discord には即座に「考え中...」のレスポンスを返す
+      console.log(`🔄 [WORKFLOW] インスタンスを作成しました (ID: ${instance.id})`);
+
       return new Response(
         JSON.stringify({
           type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
@@ -255,13 +312,14 @@ export default {
   },
 };
 
-// ユーティリティ関数群
+// ユーティリティ関数（詳細ログ付き）
 async function fetchGeminiSequential(apiKeys, payload) {
   let lastError = '';
 
   for (let i = 0; i < apiKeys.length; i++) {
     const apiKey = apiKeys[i];
-    console.log(`APIキー #${i + 1} を試行中...`);
+    const keyLabel = `Key #${i + 1}`;
+    console.log(`🌐 [GEMINI] ${keyLabel} を使用してAPI呼び出しを開始します...`);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
     try {
@@ -272,20 +330,20 @@ async function fetchGeminiSequential(apiKeys, payload) {
       });
 
       if (res.ok) {
-        console.log(`APIキー #${i + 1} で成功しました。`);
+        console.log(`✨ [GEMINI] ${keyLabel} での呼び出しに成功しました！`);
         return await res.json();
       }
 
       const errText = await res.text();
-      lastError = `Key #${i + 1} (HTTP ${res.status}): ${errText}`;
-      console.warn(`APIキー #${i + 1} 失敗 -> 次のキーへ。理由: HTTP ${res.status}`);
+      lastError = `${keyLabel} (HTTP ${res.status}): ${errText}`;
+      console.warn(`⚠️ [GEMINI] ${keyLabel} 失敗 (HTTP ${res.status}): ${errText}`);
     } catch (err) {
-      lastError = `Key #${i + 1} エラー: ${err.message}`;
-      console.warn(`APIキー #${i + 1} 例外発生 -> 次のキーへ。`);
+      lastError = `${keyLabel} 例外: ${err.message}`;
+      console.warn(`⚠️ [GEMINI] ${keyLabel} 例外発生: ${err.message}`);
     }
   }
 
-  throw new Error(`すべてのAPIキーで処理に失敗しました。\n詳細: ${lastError}`);
+  throw new Error(`すべてのGemini APIキーでリクエストが失敗しました。\n最終エラー: ${lastError}`);
 }
 
 function getLevenshteinDistance(a, b) {
