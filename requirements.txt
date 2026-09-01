@@ -1,0 +1,6 @@
+discord.py
+google-genai
+pandas
+pillow
+python-dotenv
+requests
