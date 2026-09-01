@@ -11,7 +11,8 @@ export default {
     const timestamp = request.headers.get('x-signature-timestamp');
     const bodyText = await request.text();
 
-    const isValidRequest = verifyKey(
+
+    const isValidRequest = await verifyKey(
       bodyText,
       signature,
       timestamp,
