@@ -79,8 +79,28 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
     const base64Image = arrayBufferToBase64(imageBuffer);
     const mimeType = imageRes.headers.get('content-type') || 'image/jpeg';
 
-    // 2. Gemini API 呼び出し (JSONモード & temperature: 0 でOCR精度最大化)
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+    // 2. APIキー一覧の準備（カンマ区切り ＆ GEMINI_API_KEY_2... 等に両対応）
+    const apiKeys = [];
+    if (env.GEMINI_API_KEY) {
+      env.GEMINI_API_KEY.split(',').forEach((k) => {
+        const trimmed = k.trim();
+        if (trimmed) apiKeys.push(trimmed);
+      });
+    }
+    for (let i = 2; i <= 10; i++) {
+      const keyName = `GEMINI_API_KEY_${i}`;
+      if (env[keyName]) {
+        const trimmed = env[keyName].trim();
+        if (trimmed && !apiKeys.includes(trimmed)) {
+          apiKeys.push(trimmed);
+        }
+      }
+    }
+
+    if (apiKeys.length === 0) {
+      throw new Error('GEMINI_API_KEY が設定されていません。');
+    }
+
     const prompt = `
     添付されたトレーディングカードゲーム「蟲神器」のデッキリスト画像を非常に精密に解析してください。
     画像に含まれるすべてのカードについて、以下の情報を正確に読み取ってください。
@@ -104,27 +124,51 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
         },
       ],
       generationConfig: {
-        responseMimeType: "application/json",
+        responseMimeType: 'application/json',
         temperature: 0.0,
       },
     };
 
-    const geminiRes = await fetch(geminiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(geminiPayload),
-    });
+    // 3. Gemini API 呼び出し (失敗時に次のAPIキーへ自動切替)
+    let geminiData = null;
+    let lastError = null;
 
-    const geminiData = await geminiRes.json();
+    for (let i = 0; i < apiKeys.length; i++) {
+      const apiKey = apiKeys[i];
+      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+
+      try {
+        const geminiRes = await fetch(geminiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(geminiPayload),
+        });
+
+        if (geminiRes.ok) {
+          geminiData = await geminiRes.json();
+          break; // 成功したらループを抜ける
+        } else {
+          const errText = await geminiRes.text();
+          lastError = `API Key #${i + 1} Error (${geminiRes.status}): ${errText}`;
+        }
+      } catch (err) {
+        lastError = `API Key #${i + 1} Fetch Error: ${err.message}`;
+      }
+    }
+
+    if (!geminiData) {
+      throw new Error(`すべてのGemini APIキーで処理が失敗しました。 (${lastError})`);
+    }
+
     const textResult = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
     const cardsDetected = JSON.parse(textResult);
 
-    // 3. スプレッドシートからマスターデータ取得
+    // 4. スプレッドシートからマスターデータ取得
     const sheetRes = await fetch(env.MASTER_SHEET_CSV_URL);
     const sheetCsvText = await sheetRes.text();
     const masterRows = parseCSV(sheetCsvText);
 
-    // 4. カード照合（優先度判定付き）
+    // 5. カード照合（優先度判定付き）
     let totalMatched = 0;
     const summaryLines = [];
     const outputCounts = new Array(masterRows.length).fill(0);
@@ -196,7 +240,7 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
       `【解析完了】計 ${totalMatched} 枚を照合しました。\n` +
       summaryLines.join('\n');
 
-    // 5. Discordに返答メッセージとCSVファイルを送信
+    // 6. Discordに返答メッセージとCSVファイルを送信
     const formData = new FormData();
     formData.append(
       'payload_json',
