@@ -11,7 +11,6 @@ export default {
     const timestamp = request.headers.get('x-signature-timestamp');
     const bodyText = await request.text();
 
-
     const isValidRequest = await verifyKey(
       bodyText,
       signature,
@@ -40,7 +39,6 @@ export default {
       const interactionToken = interaction.token;
       const appId = env.DISCORD_APPLICATION_ID;
 
-      // 画像アタッチメントの取得
       const resolvedAttachments = interaction.data.resolved?.attachments;
       const optionImageId = interaction.data.options?.[0]?.value;
       const attachment = resolvedAttachments?.[optionImageId];
@@ -55,12 +53,10 @@ export default {
         );
       }
 
-      // バックグラウンドで非同期処理を実行（3秒タイムアウト回避）
       ctx.waitUntil(
         processDeckAndFollowup(attachment.url, appId, interactionToken, env)
       );
 
-      // 即座に「解析中...」レスポンスを返答
       return new Response(
         JSON.stringify({
           type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
@@ -83,19 +79,18 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
     const base64Image = arrayBufferToBase64(imageBuffer);
     const mimeType = imageRes.headers.get('content-type') || 'image/jpeg';
 
-    // 2. Gemini API 呼び出し
+    // 2. Gemini API 呼び出し (JSONモード & temperature: 0 でOCR精度最大化)
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
     const prompt = `
-    添付されたトレーディングカードゲーム「蟲神器」のデッキリスト画像を解析してください。
-    画像に含まれるすべてのカードについて、以下の情報を正確に読み取り、JSON配列形式で出力してください。
+    添付されたトレーディングカードゲーム「蟲神器」のデッキリスト画像を非常に精密に解析してください。
+    画像に含まれるすべてのカードについて、以下の情報を正確に読み取ってください。
 
-    抽出項目:
-    - card_name: カード名（例: "オオアカエダカマキリ", "ヘラクレスオオカブト", "空蝉の皮鎧"）
+    - card_name: カード名（漢字・ひらがな・カタカナを正確に読み取ってください）
     - color: カードの色（"赤", "青", "緑", "無色", "術・強化"）
     - cost: カード左上のコスト数値（0〜10の整数）
-    - count: 画像内の枚数（1または2）
+    - count: 画像内の同名カードの枚数（1または2）
 
-    出力形式はJSONのみとし、余計なマークダウン装飾（\`\`\`jsonなど）は除外してください。
+    出力は以下のプロパティを持つJSONオブジェクトの配列として出力してください:
     [{"card_name": "オオアカエダカマキリ", "color": "赤", "cost": 6, "count": 1}]
     `;
 
@@ -108,6 +103,10 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
           ],
         },
       ],
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.0,
+      },
     };
 
     const geminiRes = await fetch(geminiUrl, {
@@ -117,9 +116,7 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
     });
 
     const geminiData = await geminiRes.json();
-    let textResult =
-      geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-    textResult = textResult.replace(/```json/g, '').replace(/```/g, '').trim();
+    const textResult = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
     const cardsDetected = JSON.parse(textResult);
 
     // 3. スプレッドシートからマスターデータ取得
@@ -127,7 +124,7 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
     const sheetCsvText = await sheetRes.text();
     const masterRows = parseCSV(sheetCsvText);
 
-    // 4. カード照合
+    // 4. カード照合（優先度判定付き）
     let totalMatched = 0;
     const summaryLines = [];
     const outputCounts = new Array(masterRows.length).fill(0);
@@ -138,6 +135,7 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
       const cost = String(card.cost ?? '').trim();
       const count = Number(card.count || 1);
 
+      // 【優先度1】カード名・色・コストの完全一致
       let matchedIndex = masterRows.findIndex(
         (r) =>
           r.card_name === name &&
@@ -145,14 +143,43 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
           String(r.cost) === cost
       );
 
+      // 【優先度2】色とコストが完全一致するカードの中から、名前の文字類似度が最も高いものを選択
+      if (matchedIndex === -1) {
+        const sameColorCostCandidates = masterRows
+          .map((r, idx) => ({ row: r, index: idx }))
+          .filter(
+            ({ row }) =>
+              row.color_name === color && String(row.cost) === cost
+          );
+
+        if (sameColorCostCandidates.length > 0) {
+          let minDistance = Infinity;
+          let bestCandidateIndex = -1;
+
+          for (const candidate of sameColorCostCandidates) {
+            const dist = getLevenshteinDistance(name, candidate.row.card_name);
+            if (dist < minDistance) {
+              minDistance = dist;
+              bestCandidateIndex = candidate.index;
+            }
+          }
+          matchedIndex = bestCandidateIndex;
+        }
+      }
+
+      // 【優先度3】名前の部分一致／フォールバック
       if (matchedIndex === -1) {
         matchedIndex = masterRows.findIndex((r) => r.card_name === name);
       }
 
+      // 結果の集計
       if (matchedIndex !== -1) {
+        const matchedCard = masterRows[matchedIndex];
         outputCounts[matchedIndex] += count;
         totalMatched += count;
-        summaryLines.push(`・${name} (${color}/コスト${cost}): ${count}枚`);
+        summaryLines.push(
+          `・${matchedCard.card_name} (${color}/コスト${cost}): ${count}枚`
+        );
       } else {
         summaryLines.push(`⚠️ 照合失敗: ${name} (${color}/コスト${cost})`);
       }
@@ -194,6 +221,30 @@ async function processDeckAndFollowup(imageUrl, appId, token, env) {
       }),
     });
   }
+}
+
+// 2つの文字列間の編集距離（レーベンシュタイン距離）を計算
+function getLevenshteinDistance(a, b) {
+  if (!a) return b ? b.length : 0;
+  if (!b) return a.length;
+  const matrix = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+  return matrix[b.length][a.length];
 }
 
 function arrayBufferToBase64(buffer) {
