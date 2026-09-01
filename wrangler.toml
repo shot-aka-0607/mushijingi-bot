@@ -2,6 +2,13 @@ name = "mushijingi-bot"
 main = "index.js"
 compatibility_date = "2026-09-01"
 
+compatibility_flags = [ "nodejs_compat" ]
+
+[vars]
+DISCORD_APPLICATION_ID = "1544315091032211586"
+DISCORD_PUBLIC_KEY = "2f20472f5228ef9b0ab73ed34b6f4784dd1315b0bc8bd83a9f6f292b4191e763"
+MASTER_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTTPTrwwlEwxUffZbhSrrKInhvWfVwSHJ7adR469_wW6kYqnQW_5_VY4X5plOWPARlxL3FdOn7vsp6G/pub?output=csv"
+
 [observability]
 enabled = true
 
