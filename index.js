@@ -1,4 +1,4 @@
-import { InteractionType, InteractionResponseType, verifyKey } from 'https://esm.sh/discord-interactions@4.0.0';
+import { InteractionType, InteractionResponseType, verifyKey } from 'discord-interactions';
 
 export default {
   async fetch(request, env, ctx) {
