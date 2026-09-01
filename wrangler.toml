@@ -19,12 +19,3 @@ enabled = true
 name = "deck-analysis-workflow"
 binding = "DECK_WORKFLOW"
 class_name = "DeckAnalysisWorkflow"
-
-[observability]
-enabled = true
-
-[observability.logs]
-enabled = true
-
-[observability.traces]
-enabled = true
